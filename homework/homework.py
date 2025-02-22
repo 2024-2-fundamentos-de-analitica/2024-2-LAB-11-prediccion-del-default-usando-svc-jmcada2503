@@ -95,3 +95,160 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import glob
+import gzip
+import json
+import pickle
+import zipfile
+import pandas as pd
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.svm import SVC
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+    make_scorer,
+)
+from sklearn.model_selection import GridSearchCV, StratifiedKFold
+
+def load_dataset():
+    df_test = pd.read_csv(
+        "./files/input/test_data.csv.zip",
+        index_col=False,
+        compression="zip",
+    )
+
+    df_train = pd.read_csv(
+        "./files/input/train_data.csv.zip",
+        index_col=False,
+        compression="zip",
+    )
+
+    return df_train, df_test
+
+def preprocess_data(df):
+    df_temp = df.copy()
+    df_temp = df_temp.rename(columns={"default payment next month": "default"})
+    df_temp = df_temp.drop(columns=["ID"])
+    df_temp = df_temp.loc[df["MARRIAGE"] != 0]
+    df_temp = df_temp.loc[df["EDUCATION"] != 0]
+    df_temp["EDUCATION"] = df_temp["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
+    df_temp = df_temp.dropna()
+    return df_temp
+
+def separate_features_and_target(df):
+    return df.drop(columns=["default"]), df["default"]
+
+def build_pipeline(x_train):
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
+    numerical_features = list(set(x_train.columns).difference(categorical_features))
+    feature_transformer = ColumnTransformer(
+        transformers=[
+            ("encoder", OneHotEncoder(handle_unknown="ignore"), categorical_features),
+            (
+                "scaler",
+                StandardScaler(with_mean=True, with_std=True),
+                numerical_features,
+            ),
+        ],
+        remainder="passthrough",
+    )
+
+    model_pipeline = Pipeline(
+        [
+            ("preprocessor", feature_transformer),
+            ("pca", PCA()),
+            ("feature_selection", SelectKBest(score_func=f_classif)),
+            ("classifier", SVC(kernel="rbf", random_state=12345, max_iter=-1)),
+        ]
+    )
+
+    return model_pipeline
+
+def configure_estimator(pipeline, x_train):
+    search_params = {
+        "pca__n_components": [20, x_train.shape[1] - 2],
+        "feature_selection__k": [12],
+        "classifier__kernel": ["rbf"],
+        "classifier__gamma": [0.1],
+    }
+
+    cross_validator = StratifiedKFold(n_splits=10)
+
+    scoring_function = make_scorer(balanced_accuracy_score)
+
+    grid_search = GridSearchCV(
+        estimator=pipeline, param_grid=search_params, scoring=scoring_function, cv=cross_validator, n_jobs=-1
+    )
+
+    return grid_search
+
+def create_output_directory(output_path):
+    if os.path.exists(output_path):
+        for file in glob(f"{output_path}/*"):
+            os.remove(file)
+        os.rmdir(output_path)
+    os.makedirs(output_path)
+
+def save_model(file_path, estimator):
+    create_output_directory("files/models/")
+    with gzip.open(file_path, "wb") as f:
+        pickle.dump(estimator, f)
+
+def compute_metrics(dataset_name, y_actual, y_predicted):
+    return {
+        "type": "metrics",
+        "dataset": dataset_name,
+        "precision": precision_score(y_actual, y_predicted, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_actual, y_predicted),
+        "recall": recall_score(y_actual, y_predicted, zero_division=0),
+        "f1_score": f1_score(y_actual, y_predicted, zero_division=0),
+    }
+
+def generate_confusion_matrix(dataset_name, y_actual, y_predicted):
+    cm = confusion_matrix(y_actual, y_predicted)
+    return {
+        "type": "cm_matrix",
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
+    }
+
+data_train, data_test = load_dataset()
+data_train = preprocess_data(data_train)
+data_test = preprocess_data(data_test)
+x_train, y_train = separate_features_and_target(data_train)
+x_test, y_test = separate_features_and_target(data_test)
+pipeline = build_pipeline(x_train)
+
+estimator = configure_estimator(pipeline, x_train)
+estimator.fit(x_train, y_train)
+
+save_model(
+    os.path.join("files/models/", "model.pkl.gz"),
+    estimator,
+)
+
+y_test_pred = estimator.predict(x_test)
+test_metrics = compute_metrics("test", y_test, y_test_pred)
+y_train_pred = estimator.predict(x_train)
+train_metrics = compute_metrics("train", y_train, y_train_pred)
+
+test_confusion_data = generate_confusion_matrix("test", y_test, y_test_pred)
+train_confusion_data = generate_confusion_matrix("train", y_train, y_train_pred)
+
+os.makedirs("files/output/", exist_ok=True)
+
+with open("files/output/metrics.json", "w", encoding="utf-8") as file:
+    file.write(json.dumps(train_metrics) + "\n")
+    file.write(json.dumps(test_metrics) + "\n")
+    file.write(json.dumps(train_confusion_data) + "\n")
+    file.write(json.dumps(test_confusion_data) + "\n")
